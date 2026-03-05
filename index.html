@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Pixel Cat</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#07101e;display:flex;align-items:center;
+  justify-content:center;overflow:hidden;touch-action:none;user-select:none}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ─────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────
+const cv = document.getElementById('c');
+const ct = cv.getContext('2d');
+let W, H;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.min(window.innerWidth, 480);
+  H = Math.min(window.innerHeight, 900);
+  cv.width  = W * dpr;
+  cv.height = H * dpr;
+  cv.style.width  = W + 'px';
+  cv.style.height = H + 'px';
+  ct.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─────────────────────────────────────────────
+//  PALETTE  (fill, highlight, shadow, glow-css)
+// ─────────────────────────────────────────────
+const PAL = [
+  { f:'#FF4757', h:'#FF8A96', d:'#99111E', g:'rgba(255,71,87,.8)'   },
+  { f:'#1E9EFF', h:'#65BBFF', d:'#0044AA', g:'rgba(30,158,255,.8)'  },
+  { f:'#2ED573', h:'#70E99A', d:'#12773A', g:'rgba(46,213,115,.8)'  },
+  { f:'#FFD700', h:'#FFE74C', d:'#997700', g:'rgba(255,215,0,.8)'   },
+  { f:'#BF5FFF', h:'#D896FF', d:'#6600CC', g:'rgba(191,95,255,.8)'  },
+  { f:'#FF6348', h:'#FF9A8A', d:'#992200', g:'rgba(255,99,72,.8)'   },
+  { f:'#FF6EB4', h:'#FFAACC', d:'#992268', g:'rgba(255,110,180,.8)' },
+  { f:'#00CFDD', h:'#4DE4EE', d:'#007788', g:'rgba(0,207,221,.8)'   },
+];
+
+// ─────────────────────────────────────────────
+//  SEEDED RNG
+// ─────────────────────────────────────────────
+let _s = 1;
+const srng = n => { _s = ((n ^ 0x9E3779B9) >>> 0) || 1; };
+const rng  = ()  => { _s ^= _s<<13; _s ^= _s>>17; _s ^= _s<<5; return (_s>>>0)/4294967296; };
+const ri   = n   => ~~(rng()*n);
+
+// ─────────────────────────────────────────────
+//  PROCEDURAL PIXEL ART GENERATOR
+//  Uses noise + mirroring to make recognisable-ish shapes
+// ─────────────────────────────────────────────
+function genArt(lv, cols, rows) {
+  srng(lv * 6271 + 11117);
+  const nC = Math.min(3 + ~~((lv-1)/1), 8); // start at 3 colors, ramp fast up to 8
+
+  // Pick nC random palette indices (shuffled)
+  const order = [0,1,2,3,4,5,6,7];
+  for (let i=7;i>0;i--) { const j=ri(i+1); [order[i],order[j]]=[order[j],order[i]]; }
+  const chosen = order.slice(0, nC);
+
+  // Generate left half with layered noise, then mirror
+  const half = ~~(cols/2) + (cols%2);
+  const grid = [];
+  for (let r=0; r<rows; r++) {
+    const row = [];
+    for (let c=0; c<half; c++) {
+      const nr = (r - rows/2) / (rows/2);
+      const nc = (c - half/2) / (half/2);
+      const dist = Math.sqrt(nr*nr + nc*nc*1.3);
+      const edge = Math.max(0, 1 - dist * 1.05); // slightly less fade = fuller image
+      const n1 = Math.sin(r*1.3 + c*0.8 + lv) * Math.cos(r*0.7 - c*1.1);
+      const n2 = Math.sin(r*2.1 - c*0.5 + lv*0.3) * 0.5;
+      const n3 = Math.cos(r*0.9 + c*1.7 + lv*0.7) * 0.3; // extra layer for variety
+      const val = (n1 + n2 + n3 + 1.5) / 3 * edge;
+      let ci;
+      if (val < 0.08) ci = -1; // empty (tighter threshold = more filled)
+      else {
+        const band = Math.min(~~(val * (nC + 0.5)), nC - 1);
+        ci = chosen[band];
+      }
+      row.push(ci);
+    }
+    // Mirror
+    const full = [...row];
+    for (let c=half-1; c>= (cols%2===0?0:1); c--) full.push(row[c]);
+    grid.push(full.slice(0, cols).map(ci => ({ ci: ci < 0 ? -1 : ci, hp: ci < 0 ? 0 : 1 })));
+  }
+  return { grid, chosen };
+}
+
+// ─────────────────────────────────────────────
+//  LEVEL SETUP
+// ─────────────────────────────────────────────
+function mkLevel(lv) {
+  const cols = Math.min(14 + ~~((lv-1)/2), 26); // start big, go huge
+  const rows = Math.min(11 + ~~((lv-1)/2), 20);
+  const { grid, chosen } = genArt(lv, cols, rows);
+
+  // Count live blocks per colour
+  const cnt = new Array(PAL.length).fill(0);
+  for (const row of grid) for (const b of row) if (b.hp > 0) cnt[b.ci]++;
+
+  // Build queue: cats with ammo, one colour at a time, shuffled
+  srng(lv * 9001 + 4567);
+  const queue = [];
+  for (let ci = 0; ci < PAL.length; ci++) {
+    if (!cnt[ci]) continue;
+    let rem = cnt[ci];
+    while (rem > 0) {
+      const ammo = Math.min(rem, 4 + ri(6));
+      queue.push({ ci, ammo, maxAmmo: ammo });
+      rem -= ammo;
+    }
+  }
+  // Shuffle queue
+  for (let i=queue.length-1; i>0; i--) {
+    const j = ri(i+1); [queue[i], queue[j]] = [queue[j], queue[i]];
+  }
+
+  const total = grid.flat().filter(b => b.hp > 0).length;
+  return { grid, cols, rows, queue, total };
+}
+
+// ─────────────────────────────────────────────
+//  LAYOUT
+// ─────────────────────────────────────────────
+const HUD_H  = 54;   // top bar
+const PNLH   = 172;  // bottom panel
+const TRK    = 40;   // belt track width
+
+function lay() {
+  const mg = 10;
+  const bW = W - mg*2;
+  const bH = H - HUD_H - PNLH - mg*2 - 6;
+  const bX = mg, bY = HUD_H + mg;
+  // Grid sits inside the track
+  const gX = bX + TRK, gY = bY + TRK;
+  const gW = bW - TRK*2, gH = bH - TRK*2;
+  const blW = gW / G.cols, blH = gH / G.rows;
+  // Belt centreline
+  const lx = bX + TRK/2, rx = bX + bW - TRK/2;
+  const ty = bY + TRK/2, by2 = bY + bH - TRK/2;
+  // Perimeter segments (CCW: left↑, top→, right↓, bottom←)
+  const sL = bH - TRK, sT = bW - TRK;
+  const peri = 2*(sL + sT);
+  return { bX,bY,bW,bH, gX,gY,gW,gH, blW,blH,
+           lx,rx,ty,by2, sL,sT,peri,
+           panelY: bY + bH + mg + 4 };
+}
+
+// Convert belt distance → {x,y,seg}
+// Route: bottom-left → right (seg0) → right side up (seg1) → top left (seg2) → left side down (seg3)
+function beltPos(dist, L) {
+  const { lx, rx, ty, by2, sL, sT, peri } = L;
+  dist = ((dist % peri) + peri) % peri;
+  if (dist < sT) {                          // seg 0: bottom →
+    return { x: lx + (rx-lx)*(dist/sT), y: by2, seg: 0 };
+  } else if (dist < sT+sL) {               // seg 1: right ↑
+    return { x: rx, y: by2 - (by2-ty)*((dist-sT)/sL), seg: 1 };
+  } else if (dist < 2*sT+sL) {             // seg 2: top ←
+    return { x: rx - (rx-lx)*((dist-sT-sL)/sT), y: ty, seg: 2 };
+  } else {                                  // seg 3: left ↓
+    return { x: lx, y: ty + (by2-ty)*((dist-2*sT-sL)/sL), seg: 3 };
+  }
+}
+
+// Find target: returns the CLOSEST block in the line of fire.
+// Only fires if that closest block matches the cat's colour.
+// This prevents jumping over blocks of other colours.
+function findTarget(cat, pos, L) {
+  const { blW, blH } = L;
+  const { grid, cols, rows } = G;
+  const seg = pos.seg;
+
+  if (seg === 0) { // bottom → shoot UP each column
+    if (pos.x < L.gX || pos.x > L.gX + L.gW) return null;
+    const c = Math.min(~~((pos.x - L.gX) / blW), cols-1);
+    // closest = highest row index (bottom of grid)
+    for (let r=rows-1; r>=0; r--) {
+      const b = grid[r]?.[c];
+      if (b && b.hp > 0) return b.ci === cat.ci ? {r,c} : null;
+    }
+  } else if (seg === 1) { // right side → shoot LEFT across row
+    if (pos.y < L.gY || pos.y > L.gY + L.gH) return null;
+    const r = Math.min(~~((pos.y - L.gY) / blH), rows-1);
+    // closest = highest col index (right side of grid)
+    for (let c=cols-1; c>=0; c--) {
+      const b = grid[r]?.[c];
+      if (b && b.hp > 0) return b.ci === cat.ci ? {r,c} : null;
+    }
+  } else if (seg === 2) { // top → shoot DOWN each column
+    if (pos.x < L.gX || pos.x > L.gX + L.gW) return null;
+    const c = Math.min(~~((pos.x - L.gX) / blW), cols-1);
+    // closest = lowest row index (top of grid)
+    for (let r=0; r<rows; r++) {
+      const b = grid[r]?.[c];
+      if (b && b.hp > 0) return b.ci === cat.ci ? {r,c} : null;
+    }
+  } else if (seg === 3) { // left side → shoot RIGHT across row
+    if (pos.y < L.gY || pos.y > L.gY + L.gH) return null;
+    const r = Math.min(~~((pos.y - L.gY) / blH), rows-1);
+    // closest = lowest col index (left side of grid)
+    for (let c=0; c<cols; c++) {
+      const b = grid[r]?.[c];
+      if (b && b.hp > 0) return b.ci === cat.ci ? {r,c} : null;
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────
+//  GAME STATE
+// ─────────────────────────────────────────────
+let G = null, tick = 0;
+const BELT_SPD = 2.8; // px per frame along perimeter
+const BELT_MAX = 4;   // max cats on belt at once
+const SHELF_SZ = 4;   // shelf slots
+const MIN_GAP  = 55;  // minimum belt-distance between cats
+
+function newGame(lv) {
+  const Lv = mkLevel(lv);
+  G = {
+    lv, score: 0, phase: 'play',
+    grid: Lv.grid, cols: Lv.cols, rows: Lv.rows,
+    total: Lv.total, cleared: 0,
+    queue: Lv.queue,  // all waiting cats
+    pending: [],      // tapped but waiting for gap to clear
+    belt:  [],        // cats currently on loop
+    exits: [],        // cats flying off-screen after finishing
+    shelf: new Array(SHELF_SZ).fill(null),
+    projs: [], parts: [], pops: [],
+    combo: 0, comboTimer: 0, comboMax: 0,
+    shake: 0,
+  };
+}
+
+// ─────────────────────────────────────────────
+//  PANEL LAYOUT HELPERS
+// ─────────────────────────────────────────────
+// Queue: 3 cols × 2 rows — RIGHT side (near belt entry at bottom-left, player reads right-to-left flow)
+function qCells(L) {
+  const csz=46, gap=5, cols=3, rows=2;
+  const totalW = cols*(csz+gap)-gap;
+  const x0 = W - L.bX - 6 - totalW;
+  const y0 = L.panelY + 36;
+  const cells = [];
+  for (let i=0; i<cols*rows; i++) {
+    const c=i%cols, r=~~(i/cols);
+    cells.push({ x: x0+c*(csz+gap), y: y0+r*(csz+gap), w: csz, h: csz });
+  }
+  return cells;
+}
+
+// Shelf: 4 slots — LEFT side
+function sCells(L) {
+  const csz=36, gap=5;
+  const x0 = L.bX + 6;
+  const y0 = L.panelY + 68;
+  return Array.from({length:4}, (_,i) => ({ x: x0+i*(csz+gap), y: y0, w: csz, h: csz }));
+}
+
+// ─────────────────────────────────────────────
+//  INPUT
+// ─────────────────────────────────────────────
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const rc = cv.getBoundingClientRect();
+  const px = (e.clientX-rc.left)*(W/rc.width);
+  const py = (e.clientY-rc.top)*(H/rc.height);
+  onTap(px, py);
+}, { passive:false });
+
+function onTap(px, py) {
+  if (!G) return;
+  if (G.phase !== 'play') { newGame(G.phase==='win' ? G.lv+1 : G.lv); return; }
+  const L = lay();
+
+  // Queue cells
+  for (let i=0; i<qCells(L).length; i++) {
+    const { x,y,w,h } = qCells(L)[i];
+    if (px>=x && px<=x+w && py>=y && py<=y+h) { deployQ(i); return; }
+  }
+  // Shelf cells
+  for (let i=0; i<SHELF_SZ; i++) {
+    const { x,y,w,h } = sCells(L)[i];
+    if (px>=x && px<=x+w && py>=y && py<=y+h) { deployS(i); return; }
+  }
+}
+
+function deployQ(idx) {
+  if (idx >= G.queue.length) return;
+  if (G.belt.length + G.pending.length >= BELT_MAX) { mkPop('BELT FULL', W/2, HUD_H+28, '#FF4757'); return; }
+  const cat = G.queue.splice(idx, 1)[0];
+  G.pending.push({ ...cat });
+}
+
+function deployS(i) {
+  if (!G.shelf[i]) return;
+  if (G.belt.length + G.pending.length >= BELT_MAX) { mkPop('BELT FULL', W/2, HUD_H+28, '#FF4757'); return; }
+  G.pending.push({ ...G.shelf[i] });
+  G.shelf[i] = null;
+}
+
+// Move a cat from pending onto the belt only once there's enough gap at the entry point
+function flushPending() {
+  if (!G.pending.length) return;
+  // The most recently entered cat has the smallest dist
+  const minDist = G.belt.length ? Math.min(...G.belt.map(c => c.dist)) : Infinity;
+  if (minDist >= MIN_GAP) {
+    const cat = G.pending.shift();
+    G.belt.push({ ...cat, dist: 0, shootCd: 25 });
+  }
+}
+
+// ─────────────────────────────────────────────
+//  UPDATE
+// ─────────────────────────────────────────────
+function update() {
+  if (!G || G.phase !== 'play') { tick++; return; }
+  tick++;
+  G.shake = 0;
+  if (G.comboTimer > 0 && --G.comboTimer === 0) G.combo = 0;
+
+  const L = lay();
+
+  // Try to move pending cats onto belt with proper gap
+  flushPending();
+
+  // ── Belt cats ──────────────────────────
+  for (let i = G.belt.length-1; i >= 0; i--) {
+    const cat = G.belt[i];
+    cat.dist += BELT_SPD;
+
+    // Completed one full loop → try to park on shelf; lose if shelf full
+    if (cat.dist >= L.peri) {
+      G.belt.splice(i, 1);
+      if (cat.ammo > 0) {
+        const slot = G.shelf.indexOf(null);
+        if (slot >= 0) {
+          G.shelf[slot] = { ci: cat.ci, ammo: cat.ammo, maxAmmo: cat.maxAmmo };
+        } else {
+          // Shelf full — game over
+          G.phase = 'lose';
+          return;
+        }
+      }
+      continue;
+    }
+
+    if (cat.shootCd > 0) { cat.shootCd--; continue; }
+
+    const pos = beltPos(cat.dist, L);
+    const tgt = findTarget(cat, pos, L);
+    if (tgt) {
+      // Skip if another projectile is already heading to this cell
+      const alreadyLocked = G.projs.some(p => p.r === tgt.r && p.c === tgt.c);
+      if (!alreadyLocked) {
+        const tx = L.gX + tgt.c*L.blW + L.blW/2;
+        const ty = L.gY + tgt.r*L.blH + L.blH/2;
+        G.projs.push({ x: pos.x, y: pos.y, tx, ty, ci: cat.ci, r: tgt.r, c: tgt.c });
+        cat.ammo--;
+        cat.shootCd = 7;  // fast enough to hit sequential blocks as cat passes
+        if (cat.ammo <= 0) {
+          // Launch exit animation from current position
+          const pos = beltPos(cat.dist, L);
+          launchExit(cat, pos);
+          G.belt.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  // ── Exit animations ────────────────────
+  for (let i = G.exits.length-1; i >= 0; i--) {
+    const e = G.exits[i];
+    e.x  += e.vx;
+    e.y  += e.vy;
+    e.vy += 0.35;       // gravity
+    e.rot += e.spin;
+    e.life--;
+    if (e.life <= 0) G.exits.splice(i, 1);
+  }
+
+  // ── Projectiles ────────────────────────
+  for (let i = G.projs.length-1; i >= 0; i--) {
+    const p = G.projs[i];
+    const dx=p.tx-p.x, dy=p.ty-p.y, d=Math.hypot(dx,dy);
+    if (d < 9) {
+      const b = G.grid[p.r]?.[p.c];
+      if (b && b.hp > 0 && b.ci === p.ci) {
+        b.hp = 0;
+        G.cleared++;
+        G.combo++;
+        G.comboTimer = 80;
+        G.comboMax = Math.max(G.comboMax, G.combo);
+        const pts = 10 * G.lv * G.combo;
+        G.score += pts;
+        G.shake = 0;
+        burst(p.tx, p.ty, PAL[p.ci]);
+        if (G.combo > 1) mkPop(`×${G.combo}`, p.tx, p.ty-24, PAL[p.ci].h);
+        mkPop(`+${pts}`, p.tx + (Math.random()>.5?12:-12), p.ty+16, '#fff');
+      }
+      G.projs.splice(i, 1);
+    } else {
+      p.x += dx/d*14; p.y += dy/d*14;
+    }
+  }
+
+  // ── Particles & popups ─────────────────
+  for (let i=G.parts.length-1;i>=0;i--) {
+    const p=G.parts[i]; p.x+=p.vx; p.y+=p.vy; p.vy+=0.28; p.vx*=0.97;
+    if (--p.life<=0) G.parts.splice(i,1);
+  }
+  for (let i=G.pops.length-1;i>=0;i--) {
+    const p=G.pops[i]; p.y-=0.9; if(--p.life<=0) G.pops.splice(i,1);
+  }
+
+  // ── Win check ──────────────────────────
+  if (G.cleared >= G.total) { G.phase = 'win'; winBurst(); return; }
+}
+
+function launchExit(cat, pos) {
+  // Fling direction depends on which belt segment the cat is on
+  const seg = pos.seg;
+  // seg 0=bottom→  1=right↑  2=top←  3=left↓
+  const vx = [3.5, 5, -3.5, -5][seg] + (Math.random()-0.5)*2;
+  const vy = [-1,  -5,  -1,   2][seg] + (Math.random()-0.5)*2;
+  const spin = (Math.random()-0.5) * 0.28;  // radians/frame
+  G.exits.push({ x: pos.x, y: pos.y, ci: cat.ci, vx, vy, spin, rot: 0, life: 52 });
+}
+
+function burst(x,y,pal) {
+  for (let i=0;i<16;i++) {
+    const a=Math.random()*Math.PI*2, s=2+Math.random()*5;
+    G.parts.push({ x,y, vx:Math.cos(a)*s, vy:Math.sin(a)*s-2.5,
+      life:18+~~(Math.random()*20), sz:2.5+Math.random()*5,
+      fill: Math.random()>.4 ? pal.f : pal.h });
+  }
+}
+function winBurst() {
+  for (let i=0;i<55;i++) {
+    const a=Math.random()*Math.PI*2, s=4+Math.random()*8;
+    G.parts.push({ x:W/2, y:H/2, vx:Math.cos(a)*s, vy:Math.sin(a)*s-5,
+      life:50+~~(Math.random()*35), sz:4+Math.random()*7,
+      fill: PAL[~~(Math.random()*PAL.length)].f });
+  }
+}
+function mkPop(t,x,y,col) { G.pops.push({t,x,y,col,life:52,max:52}); }
+
+// ─────────────────────────────────────────────
+//  RENDER
+// ─────────────────────────────────────────────
+function render() {
+  if (!G) return;
+  const L = lay();
+  ct.save();
+
+
+  drawBG();
+  drawBoard(L);
+  drawGrid(L);
+  drawBeltCats(L);
+  drawProjs();
+  drawParts();
+  drawHUD(L);
+  drawPanel(L);
+  drawPops();
+  ct.restore();
+
+  if (G.phase !== 'play') drawOverlay(L);
+}
+
+// ── Background ──────────────────────────────
+function drawBG() {
+  const g = ct.createRadialGradient(W*.5,H*.4,0, W*.5,H*.4, Math.max(W,H));
+  g.addColorStop(0,'#112038'); g.addColorStop(1,'#07101e');
+  ct.fillStyle = g; ct.fillRect(0,0,W,H);
+  ct.fillStyle = 'rgba(60,110,200,.04)';
+  for (let x=14;x<W;x+=26) for (let y=14;y<H;y+=26) {
+    ct.beginPath(); ct.arc(x,y,1.3,0,Math.PI*2); ct.fill();
+  }
+}
+
+// ── Board + belt track ──────────────────────
+function drawBoard(L) {
+  const { bX,bY,bW,bH, gX,gY,gW,gH } = L;
+
+  // Outer panel shadow
+  ct.save(); ct.shadowColor='rgba(0,0,0,.9)'; ct.shadowBlur=30; ct.shadowOffsetY=5;
+  rrect(bX,bY,bW,bH,18); ct.fillStyle='#132234'; ct.fill(); ct.restore();
+
+  // Belt background
+  const bg = ct.createLinearGradient(bX,bY,bX,bY+bH);
+  bg.addColorStop(0,'#243858'); bg.addColorStop(1,'#172640');
+  rrect(bX,bY,bW,bH,18); ct.fillStyle=bg; ct.fill();
+
+  // Animated arrow chevrons along each segment
+  drawArrows(L);
+
+  // Grid inset shadow
+  ct.save(); ct.shadowColor='rgba(0,0,0,.9)'; ct.shadowBlur=22; ct.shadowOffsetY=4;
+  rrect(gX-4,gY-4,gW+8,gH+8,6); ct.fillStyle='#0b1825'; ct.fill(); ct.restore();
+  rrect(gX-4,gY-4,gW+8,gH+8,6); ct.fillStyle='#0c1c2c'; ct.fill();
+
+  // Outer glow border
+  ct.save(); ct.shadowColor='rgba(70,150,255,.4)'; ct.shadowBlur=20;
+  ct.strokeStyle='rgba(80,160,255,.28)'; ct.lineWidth=2;
+  rrect(bX,bY,bW,bH,18); ct.stroke(); ct.restore();
+
+  // Corner bolts
+  for (const [cx2,cy2] of [[bX+13,bY+13],[bX+bW-13,bY+13],[bX+13,bY+bH-13],[bX+bW-13,bY+bH-13]]) {
+    ct.fillStyle='#182e48'; ct.beginPath(); ct.arc(cx2,cy2,5,0,Math.PI*2); ct.fill();
+    ct.fillStyle='rgba(255,255,255,.18)'; ct.beginPath(); ct.arc(cx2-1,cy2-1,2,0,Math.PI*2); ct.fill();
+  }
+}
+
+function drawArrows(L) {
+  const { lx,rx,ty,by2,sL,sT } = L;
+  const sp=28, sz=5, off=(tick*BELT_SPD)%sp;
+  ct.save(); ct.globalAlpha=.38; ct.fillStyle='rgba(140,210,255,.9)';
+  // bottom →
+  for (let d=off; d<sT; d+=sp) arrow(lx+(rx-lx)*(d/sT), by2, 0, sz);
+  // right ↑
+  for (let d=off; d<sL; d+=sp) arrow(rx, by2-(by2-ty)*(d/sL), -Math.PI/2, sz);
+  // top ←
+  for (let d=off; d<sT; d+=sp) arrow(rx-(rx-lx)*(d/sT), ty, Math.PI, sz);
+  // left ↓
+  for (let d=off; d<sL; d+=sp) arrow(lx, ty+(by2-ty)*(d/sL), Math.PI/2, sz);
+  ct.restore();
+}
+function arrow(x,y,a,s) {
+  ct.save(); ct.translate(x,y); ct.rotate(a);
+  ct.beginPath(); ct.moveTo(-s,-.58*s); ct.lineTo(s,0); ct.lineTo(-s,.58*s);
+  ct.fill(); ct.restore();
+}
+
+// ── Grid blocks ─────────────────────────────
+function drawGrid(L) {
+  const { gX,gY,blW,blH } = L;
+  const gap = Math.max(1, Math.min(blW*.1, 3.5));
+  const bs  = Math.min(blW, blH) - gap;
+  for (let r=0; r<G.rows; r++) for (let c=0; c<G.cols; c++) {
+    const b = G.grid[r][c];
+    if (!b || b.hp<=0) continue;
+    const fx = gX + c*blW + blW/2 - bs/2;
+    const fy = gY + r*blH + blH/2 - bs/2 + Math.sin(tick*.038 + r*.55 + c*.38)*1.2;
+    block3d(fx, fy, bs, PAL[b.ci]);
+  }
+}
+
+// ── Cat on belt ─────────────────────────────
+function drawBeltCats(L) {
+  // Draw exit-animation cats first (behind belt cats)
+  for (const e of G.exits) {
+    const alpha = Math.min(e.life / 20, 1);
+    ct.save();
+    ct.globalAlpha = alpha;
+    ct.translate(e.x, e.y);
+    ct.rotate(e.rot);
+    ct.shadowColor = PAL[e.ci].g;
+    ct.shadowBlur  = 14 * alpha;
+    drawCat(0, 0, 38, PAL[e.ci], null, true);
+    ct.restore();
+  }
+  // Belt cats
+  for (const cat of G.belt) {
+    const pos = beltPos(cat.dist, L);
+    ct.save();
+    ct.shadowColor = PAL[cat.ci].g;
+    ct.shadowBlur  = 16 + Math.sin(tick*.2)*5;
+    drawCat(pos.x, pos.y, 42, PAL[cat.ci], cat.ammo);
+    ct.restore();
+  }
+}
+
+// ── Projectiles ─────────────────────────────
+function drawProjs() {
+  for (const p of G.projs) {
+    ct.save(); ct.shadowColor=PAL[p.ci].f; ct.shadowBlur=18;
+    ct.fillStyle=PAL[p.ci].h; ct.beginPath(); ct.arc(p.x,p.y,5.5,0,Math.PI*2); ct.fill();
+    ct.fillStyle='#fff'; ct.beginPath(); ct.arc(p.x-1,p.y-1,2,0,Math.PI*2); ct.fill();
+    ct.restore();
+  }
+}
+
+// ── Particles ───────────────────────────────
+function drawParts() {
+  for (const p of G.parts) {
+    ct.save(); ct.globalAlpha=Math.min(p.life/26,1);
+    ct.fillStyle=p.fill; ct.shadowColor=p.fill; ct.shadowBlur=5;
+    rrect(p.x-p.sz/2, p.y-p.sz/2, p.sz, p.sz, 1.5); ct.fill();
+    ct.restore();
+  }
+}
+
+// ── Score popups ────────────────────────────
+function drawPops() {
+  for (const p of G.pops) {
+    ct.save(); ct.globalAlpha=p.life/p.max;
+    ct.fillStyle=p.col; ct.shadowColor=p.col; ct.shadowBlur=10;
+    ct.font=`bold ${~~(12*W/480)}px monospace`;
+    ct.textAlign='center'; ct.textBaseline='middle';
+    ct.fillText(p.t, p.x, p.y); ct.restore();
+  }
+}
+
+// ── HUD ─────────────────────────────────────
+function drawHUD(L) {
+  const f = W/480;
+  // Level badge
+  ct.save(); ct.shadowColor='rgba(30,100,255,.55)'; ct.shadowBlur=18;
+  ct.fillStyle='#182f5a'; rrect(W/2-48,5,96,28,14); ct.fill();
+  ct.strokeStyle='rgba(90,170,255,.5)'; ct.lineWidth=1.5;
+  rrect(W/2-48,5,96,28,14); ct.stroke(); ct.restore();
+  ct.fillStyle='#88bbff'; ct.font=`bold ${~~(12*f)}px monospace`;
+  ct.textAlign='center'; ct.textBaseline='middle'; ct.fillText(`LEVEL ${G.lv}`, W/2, 19);
+
+  // Score
+  ct.fillStyle='#4a6a8a'; ct.font=`bold ${~~(11*f)}px monospace`;
+  ct.textAlign='right'; ct.textBaseline='middle';
+  ct.fillText(String(G.score).padStart(7,'0'), W-10, 20);
+
+  // Progress bar
+  const prog=G.cleared/G.total, bw=W*.38, bh=7, bpx=(W-bw)/2, bpy=37;
+  ct.fillStyle='rgba(255,255,255,.07)'; rrect(bpx,bpy,bw,bh,4); ct.fill();
+  if (prog > 0) {
+    const pg=ct.createLinearGradient(bpx,0,bpx+bw,0);
+    pg.addColorStop(0,'#1E9EFF'); pg.addColorStop(1,'#2ED573');
+    ct.fillStyle=pg; rrect(bpx,bpy,bw*prog,bh,4); ct.fill();
+    ct.save(); ct.shadowColor='#2ED573'; ct.shadowBlur=9;
+    ct.fillStyle='rgba(46,213,115,.65)'; rrect(bpx+bw*prog-5,bpy,5,bh,3); ct.fill(); ct.restore();
+  }
+  ct.fillStyle='rgba(255,255,255,.2)'; ct.font=`${~~(7.5*f)}px monospace`;
+  ct.textAlign='center'; ct.textBaseline='middle';
+  ct.fillText(`${G.cleared} / ${G.total}`, W/2, bpy+bh+8);
+}
+
+// ── Bottom panel ────────────────────────────
+function drawPanel(L) {
+  const { bX, panelY, bW } = L;
+  const f = W/480;
+  const panW = bW, panH = PNLH-8;
+
+  // Panel bg
+  ct.save(); ct.shadowColor='rgba(0,0,0,.7)'; ct.shadowBlur=18;
+  rrect(bX, panelY, panW, panH, 14); ct.fillStyle='#0d1b2e'; ct.fill(); ct.restore();
+  ct.strokeStyle='rgba(50,100,180,.28)'; ct.lineWidth=1.5;
+  rrect(bX, panelY, panW, panH, 14); ct.stroke();
+
+  // Vertical divider — now queue is right, shelf is left, so split at ~40%
+  const divX = bX + ~~(panW*.42);
+  ct.strokeStyle='rgba(255,255,255,.06)'; ct.lineWidth=1;
+  ct.beginPath(); ct.moveTo(divX, panelY+10); ct.lineTo(divX, panelY+panH-10); ct.stroke();
+
+  // Labels  (shelf left, queue right)
+  ct.font=`bold ${~~(8.5*f)}px monospace`; ct.textBaseline='alphabetic';
+  ct.fillStyle='#35516a'; ct.textAlign='left';  ct.fillText('SHELF', bX+8,   panelY+14);
+  ct.fillStyle='#35516a'; ct.textAlign='right'; ct.fillText('QUEUE', W-bX-8, panelY+14);
+  ct.fillStyle='rgba(255,255,255,.15)'; ct.textAlign='center';
+  ct.fillText(G.queue.length > 6 ? `+${G.queue.length-6} more` : `${G.queue.length} cats`, W*.7, panelY+14);
+
+  // Queue (3×2 grid)
+  const qc = qCells(L);
+  for (let i=0; i<6; i++) {
+    const { x,y,w,h } = qc[i];
+    if (i < G.queue.length) {
+      const cat = G.queue[i];
+      // Slot bg
+      ct.fillStyle='rgba(255,255,255,.04)'; rrect(x,y,w,h,7); ct.fill();
+      ct.save();
+      ct.globalAlpha = i===0 ? 1 : i<3 ? .72 : .44;
+      if (i===0) { ct.shadowColor=PAL[cat.ci].g; ct.shadowBlur=14+Math.sin(tick*.13)*6; }
+      drawCat(x+w/2, y+h/2, w, PAL[cat.ci], cat.ammo);
+      ct.restore();
+      // Tap hint on slot 0
+      if (i===0) {
+        ct.save(); ct.globalAlpha=.28+Math.sin(tick*.15)*.22;
+        ct.fillStyle='#fff'; ct.font=`bold ${~~(7*f)}px monospace`;
+        ct.textAlign='center'; ct.textBaseline='alphabetic';
+        ct.fillText('TAP', x+w/2, y+h+13); ct.restore();
+      }
+    } else {
+      ct.fillStyle='rgba(255,255,255,.02)'; rrect(x,y,w,h,7); ct.fill();
+      ct.strokeStyle='rgba(255,255,255,.05)'; ct.lineWidth=1; rrect(x,y,w,h,7); ct.stroke();
+    }
+  }
+
+  // Shelf (4 slots)
+  const sc = sCells(L);
+  for (let i=0; i<SHELF_SZ; i++) {
+    const { x,y,w,h } = sc[i];
+    const occ = !!G.shelf[i];
+    ct.fillStyle = occ ? 'rgba(255,255,255,.07)' : 'rgba(255,255,255,.025)';
+    rrect(x,y,w,h,8); ct.fill();
+    ct.strokeStyle = occ ? 'rgba(255,255,255,.22)' : 'rgba(255,255,255,.06)';
+    ct.lineWidth=1.5; rrect(x,y,w,h,8); ct.stroke();
+    if (occ) {
+      const cat = G.shelf[i];
+      ct.save(); ct.shadowColor=PAL[cat.ci].g; ct.shadowBlur=12;
+      drawCat(x+w/2, y+h/2, w*.88, PAL[cat.ci], cat.ammo);
+      ct.restore();
+    } else {
+      ct.fillStyle='rgba(255,255,255,.07)'; ct.font=`${~~(13*f)}px monospace`;
+      ct.textAlign='center'; ct.textBaseline='middle'; ct.fillText('·', x+w/2, y+h/2);
+    }
+  }
+}
+
+// ── Win / Lose overlay ──────────────────────
+function drawOverlay() {
+  ct.fillStyle='rgba(7,16,30,.9)'; ct.fillRect(0,0,W,H);
+  drawParts();
+  const f=W/480, cy=H/2;
+  if (G.phase==='win') {
+    // Orbiting stars
+    for (let i=0;i<8;i++) {
+      const a=i/8*Math.PI*2+tick*.025, d=70+Math.sin(tick*.07+i)*12;
+      ct.save(); ct.globalAlpha=.6+Math.sin(tick*.1+i)*.28;
+      ct.fillStyle=PAL[i%PAL.length].f; ct.font=`${~~(14*f)}px serif`;
+      ct.textAlign='center'; ct.textBaseline='middle';
+      ct.fillText('★', W/2+Math.cos(a)*d, cy-10+Math.sin(a)*d*.55); ct.restore();
+    }
+    ct.save(); ct.shadowColor='#FFD700'; ct.shadowBlur=44;
+    ct.fillStyle='#FFD700'; ct.font=`bold ${~~(28*f)}px monospace`;
+    ct.textAlign='center'; ct.textBaseline='middle'; ct.fillText('LEVEL CLEAR!', W/2, cy+8); ct.restore();
+    ct.fillStyle='#6e99bb'; ct.font=`${~~(13*f)}px monospace`;
+    ct.textAlign='center'; ct.textBaseline='middle'; ct.fillText(`SCORE  ${G.score}`, W/2, cy+46);
+    if (G.comboMax>1) {
+      ct.fillStyle=PAL[4].h; ct.font=`${~~(10*f)}px monospace`;
+      ct.fillText(`BEST COMBO  ×${G.comboMax}`, W/2, cy+66);
+    }
+  } else {
+    ct.save(); ct.shadowColor='#FF4757'; ct.shadowBlur=34;
+    ct.fillStyle='#FF4757'; ct.font=`bold ${~~(24*f)}px monospace`;
+    ct.textAlign='center'; ct.textBaseline='middle'; ct.fillText('LEVEL FAILED', W/2, cy+8); ct.restore();
+    ct.fillStyle='#6e99bb'; ct.font=`${~~(13*f)}px monospace`;
+    ct.textAlign='center'; ct.textBaseline='middle'; ct.fillText(`SCORE  ${G.score}`, W/2, cy+44);
+    ct.fillStyle='rgba(255,255,255,.22)'; ct.font=`${~~(9*f)}px monospace`;
+    ct.fillText(`cleared ${G.cleared} / ${G.total}`, W/2, cy+64);
+  }
+  // Tap hint
+  ct.save(); ct.globalAlpha=.38+Math.sin(tick*.13)*.44;
+  ct.fillStyle='rgba(255,255,255,.78)'; ct.font=`${~~(10*f)}px monospace`;
+  ct.textAlign='center'; ct.textBaseline='middle';
+  ct.fillText(G.phase==='win' ? 'TAP TO CONTINUE  →' : 'TAP TO RETRY', W/2, cy+90); ct.restore();
+}
+
+// ─────────────────────────────────────────────
+//  DRAW HELPERS
+// ─────────────────────────────────────────────
+function block3d(x, y, s, pal) {
+  const r = Math.max(2, s*.14);
+  // Base + shadow
+  ct.save(); ct.shadowColor='rgba(0,0,0,.75)'; ct.shadowBlur=6;
+  ct.shadowOffsetX=1; ct.shadowOffsetY=3;
+  rrect(x,y,s,s,r); ct.fillStyle=pal.f; ct.fill(); ct.restore();
+  // Top-left gloss
+  const g1=ct.createLinearGradient(x,y,x+s*.65,y+s*.6);
+  g1.addColorStop(0,'rgba(255,255,255,.45)'); g1.addColorStop(1,'rgba(255,255,255,0)');
+  rrect(x,y,s,s,r); ct.fillStyle=g1; ct.fill();
+  // Bottom-right shadow
+  const g2=ct.createLinearGradient(x+s*.4,y+s*.4,x+s,y+s);
+  g2.addColorStop(0,'rgba(0,0,0,0)'); g2.addColorStop(1,'rgba(0,0,0,.32)');
+  rrect(x,y,s,s,r); ct.fillStyle=g2; ct.fill();
+  // Top highlight stripe
+  ct.fillStyle='rgba(255,255,255,.28)'; rrect(x+3,y+2,s-6,s*.15,1.5); ct.fill();
+}
+
+function drawCat(ocx, ocy, sz, pal, ammo, noBouce) {
+  const bs = sz * .86;
+  const bounce = noBouce ? 0 : Math.sin(tick*.26 + ocx*.04) * 2;
+  ct.save(); ct.translate(ocx, ocy + bounce);
+
+  // Body block
+  block3d(-bs/2, -bs/2, bs, pal);
+
+  // Ears
+  const ew=bs*.22, eh=bs*.3;
+  ct.fillStyle=pal.h;
+  ct.beginPath(); ct.moveTo(-bs*.42,-bs*.5); ct.lineTo(-bs*.46-ew*.1,-bs*.5-eh); ct.lineTo(-bs*.42+ew,-bs*.5); ct.fill();
+  ct.beginPath(); ct.moveTo( bs*.42,-bs*.5); ct.lineTo( bs*.46+ew*.1,-bs*.5-eh); ct.lineTo( bs*.42-ew,-bs*.5); ct.fill();
+  ct.fillStyle='rgba(255,255,255,.22)';
+  ct.beginPath(); ct.moveTo(-bs*.42,-bs*.5); ct.lineTo(-bs*.38,-bs*.5-eh*.55); ct.lineTo(-bs*.3,-bs*.5); ct.fill();
+  ct.beginPath(); ct.moveTo( bs*.42,-bs*.5); ct.lineTo( bs*.38,-bs*.5-eh*.55); ct.lineTo( bs*.3,-bs*.5); ct.fill();
+
+  // Eyes
+  const ey=-bs*.06;
+  const blink = tick%200 < 7;
+  if (blink) {
+    ct.strokeStyle='rgba(255,255,255,.92)'; ct.lineWidth=1.8; ct.lineCap='round';
+    ct.beginPath(); ct.moveTo(-bs*.27,ey); ct.lineTo(-bs*.11,ey); ct.stroke();
+    ct.beginPath(); ct.moveTo( bs*.11,ey); ct.lineTo( bs*.27,ey); ct.stroke();
+  } else {
+    ct.fillStyle='rgba(255,255,255,.96)';
+    ct.beginPath(); ct.arc(-bs*.22,ey,bs*.1,0,Math.PI*2); ct.fill();
+    ct.beginPath(); ct.arc( bs*.22,ey,bs*.1,0,Math.PI*2); ct.fill();
+    ct.fillStyle='#0a0a0a';
+    ct.beginPath(); ct.arc(-bs*.21,ey+1,bs*.057,0,Math.PI*2); ct.fill();
+    ct.beginPath(); ct.arc( bs*.23,ey+1,bs*.057,0,Math.PI*2); ct.fill();
+    ct.fillStyle='#fff';
+    ct.beginPath(); ct.arc(-bs*.245,ey-bs*.04,bs*.025,0,Math.PI*2); ct.fill();
+    ct.beginPath(); ct.arc( bs*.205,ey-bs*.04,bs*.025,0,Math.PI*2); ct.fill();
+  }
+
+  // Nose
+  ct.fillStyle=pal.d; ct.beginPath(); ct.arc(0,bs*.1,bs*.065,0,Math.PI*2); ct.fill();
+  // Mouth
+  ct.strokeStyle='rgba(255,255,255,.5)'; ct.lineWidth=1.5; ct.lineCap='round';
+  ct.beginPath();
+  ct.moveTo(-bs*.13,bs*.17); ct.lineTo(-bs*.05,bs*.24);
+  ct.lineTo(0,bs*.18); ct.lineTo(bs*.05,bs*.24); ct.lineTo(bs*.13,bs*.17);
+  ct.stroke();
+  // Whiskers
+  ct.strokeStyle='rgba(255,255,255,.32)'; ct.lineWidth=0.9;
+  for (const sx of [-1,1]) for (let wi=0;wi<3;wi++) {
+    const wy=bs*(.09+wi*.055);
+    ct.beginPath(); ct.moveTo(sx*bs*.09,wy); ct.lineTo(sx*bs*.45,wy+sx*wi*.01*bs); ct.stroke();
+  }
+  // Ammo badge
+  if (ammo !== null && ammo !== undefined) {
+    const bw=bs*.56,bh=bs*.28,bx2=-bw/2,by3=bs*.34;
+    ct.save(); ct.shadowColor='rgba(0,0,0,.6)'; ct.shadowBlur=5;
+    ct.fillStyle='rgba(0,0,0,.72)'; rrect(bx2,by3,bw,bh,4); ct.fill(); ct.restore();
+    ct.fillStyle='#fff'; ct.font=`bold ${~~(bs*.29)}px monospace`;
+    ct.textAlign='center'; ct.textBaseline='middle'; ct.fillText(ammo, 0, by3+bh/2);
+  }
+  ct.restore();
+}
+
+function rrect(x,y,w,h,r) {
+  if (w<r*2) r=w/2; if (h<r*2) r=h/2;
+  ct.beginPath();
+  ct.moveTo(x+r,y); ct.arcTo(x+w,y,x+w,y+h,r); ct.arcTo(x+w,y+h,x,y+h,r);
+  ct.arcTo(x,y+h,x,y,r); ct.arcTo(x,y,x+w,y,r); ct.closePath();
+}
+
+// ─────────────────────────────────────────────
+//  MAIN LOOP
+// ─────────────────────────────────────────────
+newGame(1);
+(function loop() { update(); render(); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
